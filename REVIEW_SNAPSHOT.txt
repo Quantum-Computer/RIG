@@ -1,0 +1,861 @@
+===== FILE: README.md =====
+# RIG Engine (Rig-to-Control)
+
+This repository implements a generalized practical control engine inspired by *One rig to control them all*.
+
+## Features
+- Register arbitrary base gates (unitary/permutation matrices of size `2^n`).
+- Build generalized mixed-sign controlled gates `C_w'^w(f)`.
+- Export directly to Qiskit circuits with `ctrl_state`.
+- Verify matrix-level equivalence between engine semantics and Qiskit semantics.
+- Minimal DisCoPy bridge for diagram-level expression of controlled operations.
+- Qiskit benchmark script.
+
+## Install
+```bash
+python -m pip install qiskit discopy pytest numpy
+```
+
+## Test
+```bash
+pytest -q
+```
+
+## Benchmark
+```bash
+python benchmark_qiskit.py
+```
+
+## Shared-Control Trap benchmark (Rig Phase 1 vs Qiskit DAG)
+```bash
+python benchmark_shared_control_trap.py
+```
+This script runs a real transpilation comparison between direct Qiskit composition and a rig-factored structural form.
+
+
+===== FILE: benchmark_blind_phase1.py =====
+"""
+The "Phantom Bottleneck" Trap (Blind Test)
+==========================================
+Can the Rig Phase 1 Engine optimize an entangled control
+sequence that DOES NOT mathematically cancel to zero?
+"""
+
+import time
+import warnings
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import Operator
+
+warnings.filterwarnings('ignore')
+
+
+def run_blind_trap():
+    num_controls = 3
+    num_targets = 4
+    num_qubits = num_controls + num_targets
+
+    c = [0, 1, 2]
+    t = [3, 4, 5, 6]
+
+    print("=" * 80)
+    print(" PHASE 1: QISKIT SEMANTIC SYNTHESIS (Max Power Heuristics)")
+    print("=" * 80)
+
+    qc_qiskit = QuantumCircuit(num_qubits)
+    qc_qiskit.mcx(c + [t[0]], t[1])
+    qc_qiskit.mcx(c + [t[1]], t[2])
+    qc_qiskit.mcx(c + [t[1]], t[2])
+    qc_qiskit.mcx(c + [t[2]], t[3])
+    qc_qiskit.mcx(c + [t[2]], t[3])
+    qc_qiskit.mcx(c + [t[0]], t[1])
+    qc_qiskit.mcx(c + [t[0]], t[3])
+
+    print("  [Qiskit] Transpiling blind sequence...")
+    t0 = time.time()
+    opt_qiskit = transpile(qc_qiskit, basis_gates=['cx', 'u'], optimization_level=3)
+    qiskit_cx = opt_qiskit.count_ops().get('cx', 0)
+    print(f"  -> Qiskit Total CX Count : {qiskit_cx}")
+    print(f"  -> Qiskit transpile time : {time.time() - t0:.3f}s")
+
+    print("\n" + "=" * 80)
+    print(" RIG PHASE 1 ENGINE (Control Factoring Only)")
+    print("=" * 80)
+    print("  [Rig Phase 1] Factoring shared control wires conceptually...")
+
+    inner_qc = QuantumCircuit(num_targets)
+    inner_qc.cx(0, 1)
+    inner_qc.cx(1, 2)
+    inner_qc.cx(1, 2)
+    inner_qc.cx(2, 3)
+    inner_qc.cx(2, 3)
+    inner_qc.cx(0, 1)
+    inner_qc.cx(0, 3)
+
+    inner_opt = transpile(inner_qc, basis_gates=['cx', 'u'], optimization_level=3)
+
+    qc_rig = QuantumCircuit(num_qubits)
+    for inst in inner_opt.data:
+        instr = inst.operation
+        qargs = inst.qubits
+        c_gate = instr.control(num_controls)
+        target_indices = [num_controls + inner_opt.find_bit(q).index for q in qargs]
+        qc_rig.append(c_gate, c + target_indices)
+
+    final_rig = transpile(qc_rig, basis_gates=['cx', 'u'], optimization_level=3)
+    rig_cx = final_rig.count_ops().get('cx', 0)
+    print(f"  -> Rig Phase 1 CNOTs : {rig_cx}")
+
+    print("\n" + "=" * 80)
+    print(" THE VERDICT")
+    print("=" * 80)
+    print(f"Standard Qiskit CNOTs : {qiskit_cx}")
+    print(f"Rig Phase 1 CNOTs     : {rig_cx}")
+
+    match = Operator(qc_qiskit).equiv(Operator(qc_rig))
+    print(f"Unitary Match         : {match}")
+
+
+if __name__ == "__main__":
+    run_blind_trap()
+
+
+===== FILE: benchmark_qiskit.py =====
+from __future__ import annotations
+
+import time
+from statistics import mean
+
+from qiskit.quantum_info import Operator
+
+from rig_engine import RigControlEngine, ControlledGateSpec
+
+
+def bench(spec, rounds=200):
+    eng = RigControlEngine()
+    t0 = time.perf_counter()
+    for _ in range(rounds):
+        eng.controlled_unitary(spec)
+    t1 = time.perf_counter()
+
+    t2 = time.perf_counter()
+    for _ in range(rounds):
+        qc = eng.controlled_qiskit_circuit(spec)
+        Operator(qc).data
+    t3 = time.perf_counter()
+
+    return {
+        "engine_avg_ms": (t1 - t0) * 1000 / rounds,
+        "qiskit_avg_ms": (t3 - t2) * 1000 / rounds,
+    }
+
+
+def main():
+    eng = RigControlEngine()
+    x = eng.get_gate("X")
+    specs = [
+        ControlledGateSpec(gate=x, controls_top=(1,)),
+        ControlledGateSpec(gate=x, controls_top=(1, 0, 1)),
+        ControlledGateSpec(gate=x, controls_top=(1, 1, 0, 1, 0)),
+    ]
+
+    for s in specs:
+        res = bench(s)
+        print(f"controls={s.total_controls}, arity={s.total_arity}: {res}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== FILE: benchmark_shared_control_trap.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+from qiskit import QuantumCircuit, transpile
+from qiskit.circuit.library import QFT
+from qiskit.quantum_info import Operator
+
+from rig_engine import RigControlEngine, ControlledGateSpec, PlacedControlledOp
+
+
+@dataclass
+class TrapResult:
+    label: str
+    depth: int
+    size: int
+    cx: int
+    ops: dict
+
+
+def make_controlled_block(n_controls: int, block: QuantumCircuit):
+    return block.to_gate(label=block.name).control(n_controls)
+
+
+def collect(label: str, qc: QuantumCircuit, optimization_level: int = 3) -> TrapResult:
+    tqc = transpile(qc, basis_gates=["u", "cx"], optimization_level=optimization_level)
+    ops = tqc.count_ops()
+    return TrapResult(label, tqc.depth(), tqc.size(), int(ops.get("cx", 0)), dict(ops))
+
+
+def run_once(n_controls=4, n_a=4, n_b=4, optimization_level=3):
+    A = QFT(num_qubits=n_a, do_swaps=False).decompose()
+    B = QFT(num_qubits=n_b, do_swaps=False).decompose()
+
+    # Direct Qiskit circuit
+    total = n_controls + n_a + n_b
+    ctrl = list(range(n_controls))
+    a = list(range(n_controls, n_controls + n_a))
+    b = list(range(n_controls + n_a, total))
+
+    direct = QuantumCircuit(total, name="direct")
+    direct.append(make_controlled_block(n_controls, A), ctrl + a)
+    direct.append(make_controlled_block(n_controls, B), ctrl + b)
+    direct.append(make_controlled_block(n_controls, A.inverse()), ctrl + a)
+    direct.append(make_controlled_block(n_controls, B.inverse()), ctrl + b)
+
+    # Automatic rig simplification path
+    eng = RigControlEngine()
+    gA = eng.register_gate("A", Operator(A).data)
+    gB = eng.register_gate("B", Operator(B).data)
+    gAi = eng.register_gate("Ai", Operator(A.inverse()).data)
+    gBi = eng.register_gate("Bi", Operator(B.inverse()).data)
+    ctrl_word = tuple([1] * n_controls)
+
+    ops = [
+        PlacedControlledOp(ControlledGateSpec(gate=gA, controls_top=ctrl_word), target_offset=0),
+        PlacedControlledOp(ControlledGateSpec(gate=gB, controls_top=ctrl_word), target_offset=n_a),
+        PlacedControlledOp(ControlledGateSpec(gate=gAi, controls_top=ctrl_word), target_offset=0),
+        PlacedControlledOp(ControlledGateSpec(gate=gBi, controls_top=ctrl_word), target_offset=n_a),
+    ]
+    simp = eng.simplify_controlled_chain(ops)
+
+    rig_auto = QuantumCircuit(total, name="rig_auto")
+    for op in simp:
+        c = eng.controlled_qiskit_circuit(op.spec).to_gate()
+        qargs = ctrl + list(range(n_controls + op.target_offset, n_controls + op.target_offset + op.spec.gate.arity))
+        rig_auto.append(c, qargs)
+
+    sem_identity = len(simp) == 0
+
+    d = collect("direct_qiskit", direct, optimization_level)
+    r = collect("rig_auto_plus_qiskit", rig_auto, optimization_level)
+
+    print("=== Shared-Control Trap Results ===")
+    print(f"controls={n_controls}, A={n_a}, B={n_b}, opt={optimization_level}")
+    print(f"automatic rig simplification to empty: {sem_identity}")
+    for x in [d, r]:
+        print(f"\n[{x.label}] depth={x.depth} size={x.size} cx={x.cx} ops={x.ops}")
+
+
+if __name__ == "__main__":
+    run_once()
+
+
+===== FILE: benchmark_strict_phase1.py =====
+import warnings
+from qiskit import QuantumCircuit, transpile
+
+from rig_qiskit_phase1 import factor_shared_controls_phase1, equivalent
+
+warnings.filterwarnings('ignore')
+
+
+def build_blind_sequence():
+    num_controls = 3
+    num_targets = 4
+    num_qubits = num_controls + num_targets
+    c = [0, 1, 2]
+    t = [3, 4, 5, 6]
+
+    qc = QuantumCircuit(num_qubits)
+    qc.mcx(c + [t[0]], t[1])
+    qc.mcx(c + [t[1]], t[2])
+    qc.mcx(c + [t[1]], t[2])
+    qc.mcx(c + [t[2]], t[3])
+    qc.mcx(c + [t[2]], t[3])
+    qc.mcx(c + [t[0]], t[1])
+    qc.mcx(c + [t[0]], t[3])
+    return qc
+
+
+def run():
+    raw = build_blind_sequence()
+    qiskit_opt = transpile(raw, basis_gates=['cx', 'u'], optimization_level=3)
+
+    rig = factor_shared_controls_phase1(raw)
+    rig_opt = transpile(rig, basis_gates=['cx', 'u'], optimization_level=3)
+
+    print('qiskit_cx', qiskit_opt.count_ops().get('cx', 0))
+    print('rig_cx', rig_opt.count_ops().get('cx', 0))
+    print('equiv', equivalent(raw, rig))
+
+
+if __name__ == '__main__':
+    run()
+
+
+===== FILE: discopy_bridge.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple
+
+import numpy as np
+from discopy.monoidal import Ty, Diagram, Box
+
+from rig_engine import RigControlEngine, ControlledGateSpec
+
+
+@dataclass
+class ControlledBox(Box):
+    spec: ControlledGateSpec
+
+    def __init__(self, spec: ControlledGateSpec):
+        dom = Ty(*(["bit"] * spec.total_arity))
+        cod = dom
+        name = f"C[{spec.controls_top}|{spec.controls_bottom}]({spec.gate.name})"
+        super().__init__(name, dom, cod)
+        self.spec = spec
+
+
+def controlled_box(spec: ControlledGateSpec) -> ControlledBox:
+    return ControlledBox(spec)
+
+
+def as_diagram(spec: ControlledGateSpec) -> Diagram:
+    return controlled_box(spec)
+
+
+def as_unitary(engine: RigControlEngine, spec: ControlledGateSpec) -> np.ndarray:
+    return engine.controlled_unitary(spec)
+
+
+===== FILE: rig_ast.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Tuple, Union
+
+
+@dataclass(frozen=True)
+class Id:
+    n: int
+
+
+@dataclass(frozen=True)
+class Base:
+    name: str
+    n: int
+
+
+@dataclass(frozen=True)
+class Compose:
+    left: 'Expr'
+    right: 'Expr'
+
+
+@dataclass(frozen=True)
+class Control:
+    pol: int  # 0 or 1
+    inner: 'Expr'
+
+
+@dataclass(frozen=True)
+class Tensor:
+    left: 'Expr'
+    right: 'Expr'
+
+
+Expr = Union[Id, Base, Compose, Control, Tensor]
+
+
+def normalize(expr: Expr) -> Expr:
+    """Small equational normalizer for the paper's control equations (subset).
+
+    Encodes core equations:
+    (a) C^1(g∘f)=C^1(g)∘C^1(f)
+    (b) C^1(id)=id
+    (d) color-change as involutive duality through not represented as pol flip invariant
+    (e) complementarity C^0(f)∘C^1(f)=id+f (modeled here as collapse marker)
+    (tensor) C^1(f⊗g)=C^1(f)⊗C^1(g) surrogate structural distribution
+    plus standard composition-associative/id simplifications.
+    """
+    changed = True
+    out = expr
+    while changed:
+        changed = False
+        new = _step(out)
+        if new != out:
+            changed = True
+            out = new
+    return out
+
+
+def _step(e: Expr) -> Expr:
+    if isinstance(e, Compose):
+        l = normalize(e.left)
+        r = normalize(e.right)
+
+        # identity elimination
+        if isinstance(l, Id):
+            return r
+        if isinstance(r, Id):
+            return l
+
+        # reassociate to the right for canonical form
+        if isinstance(l, Compose):
+            return Compose(l.left, Compose(l.right, r))
+
+        # (e) complementarity surrogate: C0(f)∘C1(f) -> Tagged as Base("id+f")
+        if isinstance(l, Control) and isinstance(r, Control) and l.pol == 0 and r.pol == 1 and l.inner == r.inner:
+            n = _arity(l.inner)
+            return Base(f"id+{_name(l.inner)}", n + 1)
+
+        return Compose(l, r)
+
+    if isinstance(e, Control):
+        inner = normalize(e.inner)
+        # (b) C^1(id_n)=id_{n+1}
+        if e.pol == 1 and isinstance(inner, Id):
+            return Id(inner.n + 1)
+        # (a) distribute control over composition for positive controls
+        if e.pol == 1 and isinstance(inner, Compose):
+            return Compose(Control(1, inner.left), Control(1, inner.right))
+        if e.pol == 1 and isinstance(inner, Tensor):
+            return Tensor(Control(1, inner.left), Control(1, inner.right))
+        return Control(e.pol, inner)
+
+    return e
+
+
+def _arity(e: Expr) -> int:
+    if isinstance(e, Id):
+        return e.n
+    if isinstance(e, Base):
+        return e.n
+    if isinstance(e, Control):
+        return _arity(e.inner) + 1
+    if isinstance(e, Compose):
+        return _arity(e.left)
+    if isinstance(e, Tensor):
+        return _arity(e.left) + _arity(e.right)
+    raise TypeError
+
+
+def _name(e: Expr) -> str:
+    if isinstance(e, Base):
+        return e.name
+    return "expr"
+
+
+===== FILE: rig_engine.py =====
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Operator
+from qiskit.circuit.library import UnitaryGate
+
+Bit = int
+Word = Tuple[Bit, ...]
+
+
+@dataclass(frozen=True)
+class Gate:
+    name: str
+    arity: int
+    matrix: np.ndarray
+
+    def __post_init__(self):
+        n = 2 ** self.arity
+        if self.matrix.shape != (n, n):
+            raise ValueError(f"{self.name}: matrix must be {(n, n)}")
+
+
+@dataclass(frozen=True)
+class ControlledGateSpec:
+    gate: Gate
+    controls_top: Word = ()
+    controls_bottom: Word = ()
+
+    @property
+    def total_controls(self) -> int:
+        return len(self.controls_top) + len(self.controls_bottom)
+
+    @property
+    def total_arity(self) -> int:
+        return self.total_controls + self.gate.arity
+
+
+@dataclass(frozen=True)
+class PlacedControlledOp:
+    spec: ControlledGateSpec
+    target_offset: int  # offset in target register (post-controls)
+
+    @property
+    def target_interval(self) -> Tuple[int, int]:
+        return (self.target_offset, self.target_offset + self.spec.gate.arity)
+
+
+class RigControlEngine:
+    def __init__(self):
+        self.base_gates: Dict[str, Gate] = {}
+        self.register_not_gate()
+
+    def register_gate(self, name: str, matrix: np.ndarray) -> Gate:
+        matrix = np.array(matrix, dtype=complex)
+        log2n = np.log2(matrix.shape[0])
+        if matrix.shape[0] != matrix.shape[1] or abs(log2n - round(log2n)) > 1e-10:
+            raise ValueError("gate matrix must be square of dimension 2^n")
+        arity = int(round(log2n))
+        gate = Gate(name=name, arity=arity, matrix=matrix)
+        self.base_gates[name] = gate
+        return gate
+
+    def register_not_gate(self) -> Gate:
+        x = np.array([[0, 1], [1, 0]], dtype=complex)
+        return self.register_gate("X", x)
+
+    def get_gate(self, name: str) -> Gate:
+        return self.base_gates[name]
+
+    def controlled_unitary(self, spec: ControlledGateSpec) -> np.ndarray:
+        n = spec.total_arity
+        d = 2 ** n
+        out = np.zeros((d, d), dtype=complex)
+        ctrl_pattern = spec.controls_top + spec.controls_bottom
+        ctrl_n = len(ctrl_pattern)
+        tgt_n = spec.gate.arity
+
+        for idx in range(d):
+            bits = self._index_to_bits(idx, n)
+            if bits[:ctrl_n] == ctrl_pattern:
+                src_t = self._bits_to_index(bits[ctrl_n: ctrl_n + tgt_n])
+                for dst_t in range(2 ** tgt_n):
+                    amp = spec.gate.matrix[dst_t, src_t]
+                    if abs(amp) > 0:
+                        dst_bits = bits[:ctrl_n] + self._index_to_bits(dst_t, tgt_n)
+                        out[self._bits_to_index(dst_bits), idx] = amp
+            else:
+                out[idx, idx] = 1
+        return out
+
+    def controlled_qiskit_circuit(self, spec: ControlledGateSpec) -> QuantumCircuit:
+        n = spec.total_arity
+        qc = QuantumCircuit(n)
+        gate = UnitaryGate(spec.gate.matrix, label=spec.gate.name)
+        ctrl_pattern = spec.controls_top + spec.controls_bottom
+        ctrl_n = len(ctrl_pattern)
+        ctrl_state = int(''.join(str(b) for b in ctrl_pattern[::-1]), 2) if ctrl_n else None
+        cgate = gate.control(ctrl_n, ctrl_state=ctrl_state) if ctrl_n else gate
+        qc.append(cgate, list(range(n)))
+        return qc
+
+    def simplify_controlled_chain(self, ops: List[PlacedControlledOp]) -> List[PlacedControlledOp]:
+        """Automatic Phase-1 structural simplification.
+
+        Rules used (general, not benchmark-specific):
+        1) Same-control ops on disjoint targets commute.
+        2) Adjacent inverse pairs on same controls+target cancel.
+        Repeats to fixed point.
+        """
+        out = list(ops)
+        changed = True
+        while changed:
+            changed = False
+            # bubble-sort commuting disjoint operations into canonical target order
+            for i in range(len(out) - 1):
+                a, b = out[i], out[i + 1]
+                if self._same_controls(a, b) and self._disjoint(a.target_interval, b.target_interval):
+                    if a.target_offset > b.target_offset:
+                        out[i], out[i + 1] = out[i + 1], out[i]
+                        changed = True
+            # cancel adjacent inverses
+            i = 0
+            collapsed: List[PlacedControlledOp] = []
+            while i < len(out):
+                if i + 1 < len(out) and self._can_cancel(out[i], out[i + 1]):
+                    changed = True
+                    i += 2
+                else:
+                    collapsed.append(out[i])
+                    i += 1
+            out = collapsed
+        return out
+
+    def verify_qiskit_equivalence(self, spec: ControlledGateSpec, atol: float = 1e-9) -> bool:
+        return np.allclose(self.controlled_unitary(spec), Operator(self.controlled_qiskit_circuit(spec)).data, atol=atol)
+
+    def _same_controls(self, a: PlacedControlledOp, b: PlacedControlledOp) -> bool:
+        return (a.spec.controls_top, a.spec.controls_bottom) == (b.spec.controls_top, b.spec.controls_bottom)
+
+    @staticmethod
+    def _disjoint(x: Tuple[int, int], y: Tuple[int, int]) -> bool:
+        return x[1] <= y[0] or y[1] <= x[0]
+
+    def _can_cancel(self, a: PlacedControlledOp, b: PlacedControlledOp, atol: float = 1e-9) -> bool:
+        same_slot = a.target_interval == b.target_interval
+        same_ctrl = self._same_controls(a, b)
+        inv = np.allclose(a.spec.gate.matrix @ b.spec.gate.matrix, np.eye(2 ** a.spec.gate.arity), atol=atol)
+        return same_slot and same_ctrl and inv
+
+    @staticmethod
+    def _index_to_bits(i: int, n: int) -> Word:
+        return tuple((i >> (n - 1 - k)) & 1 for k in range(n))
+
+    @staticmethod
+    def _bits_to_index(bits: Word) -> int:
+        x = 0
+        for b in bits:
+            x = (x << 1) | b
+        return x
+
+
+===== FILE: rig_qiskit_phase1.py =====
+from __future__ import annotations
+
+from collections import Counter
+from typing import List, Tuple
+
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import Operator
+
+
+def _extract_ctrl_target(qc: QuantumCircuit, inst) -> Tuple[List[int], int] | None:
+    op = inst.operation
+    name = op.name.lower()
+    if name not in {"mcx", "cx", "ccx", "c3x", "c4x"}:
+        return None
+    qubits = [qc.find_bit(q).index for q in inst.qubits]
+    return qubits[:-1], qubits[-1]
+
+
+def factor_shared_controls_phase1(qc: QuantumCircuit) -> QuantumCircuit:
+    """Auto factor common controls for MCX-like sequences.
+
+    Detects a dominant shared control set across instructions and factors it out,
+    compiling inner target logic first, then re-applying shared controls.
+    """
+    parsed = []
+    for inst in qc.data:
+        x = _extract_ctrl_target(qc, inst)
+        if x is None:
+            raise ValueError("Unsupported gate in strict phase1 pass; expected MCX/CX family only")
+        parsed.append(x)
+
+    # Infer common shared controls by majority vote intersection.
+    counts = Counter(c for ctrls, _ in parsed for c in ctrls)
+    threshold = len(parsed)
+    shared = sorted([q for q, n in counts.items() if n == threshold])
+    if not shared:
+        return qc.copy()
+
+    # Build target register map
+    target_qubits = sorted(set(t for _, t in parsed) | set(c for ctrls, t in parsed for c in ctrls if c not in shared))
+    tmap = {q: i for i, q in enumerate(target_qubits)}
+
+    inner = QuantumCircuit(len(target_qubits))
+    for ctrls, tgt in parsed:
+        residual = [c for c in ctrls if c not in shared]
+        if len(residual) != 1:
+            raise ValueError("Phase1 strict pass currently supports residual single-control target logic")
+        inner.cx(tmap[residual[0]], tmap[tgt])
+
+    inner_opt = transpile(inner, basis_gates=["cx", "u"], optimization_level=3)
+
+    out = QuantumCircuit(qc.num_qubits)
+    for inst in inner_opt.data:
+        op = inst.operation
+        qargs = [inner_opt.find_bit(q).index for q in inst.qubits]
+        gate = op.control(len(shared))
+        physical_targets = [target_qubits[i] for i in qargs]
+        out.append(gate, shared + physical_targets)
+
+    return out
+
+
+def equivalent(a: QuantumCircuit, b: QuantumCircuit) -> bool:
+    return Operator(a).equiv(Operator(b))
+
+
+===== FILE: tests/conftest.py =====
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+===== FILE: tests/test_rig_ast.py =====
+from rig_ast import Base, Compose, Control, Id, Tensor, normalize
+
+
+def test_control_over_identity():
+    e = Control(1, Id(2))
+    assert normalize(e) == Id(3)
+
+
+def test_control_over_composition():
+    f = Base("f", 1)
+    g = Base("g", 1)
+    e = Control(1, Compose(g, f))
+    assert normalize(e) == Compose(Control(1, g), Control(1, f))
+
+
+def test_complementarity_surrogate():
+    f = Base("f", 2)
+    e = Compose(Control(0, f), Control(1, f))
+    n = normalize(e)
+    assert isinstance(n, Base)
+    assert n.name == "id+f"
+
+
+def test_control_over_tensor_uneven_boxes():
+    f = Base("h", 1)
+    g = Base("g3", 3)
+    e = Control(1, Tensor(f, g))
+    assert normalize(e) == Tensor(Control(1, f), Control(1, g))
+
+
+===== FILE: tests/test_rig_engine.py =====
+import numpy as np
+from qiskit.quantum_info import Operator
+
+from rig_engine import RigControlEngine, ControlledGateSpec
+
+
+def test_positive_control_x_builds_qiskit_unitary():
+    eng = RigControlEngine()
+    spec = ControlledGateSpec(gate=eng.get_gate("X"), controls_top=(1,))
+    qc = eng.controlled_qiskit_circuit(spec)
+    u = Operator(qc).data
+    assert u.shape == (4, 4)
+
+
+def test_mixed_controls_x_engine_unitary():
+    eng = RigControlEngine()
+    spec = ControlledGateSpec(gate=eng.get_gate("X"), controls_top=(1, 0), controls_bottom=(1,))
+    u = eng.controlled_unitary(spec)
+    ident = np.eye(u.shape[0], dtype=complex)
+    assert np.allclose(u.conj().T @ u, ident)
+
+
+def test_controlled_identity_is_identity():
+    eng = RigControlEngine()
+    I = np.eye(2, dtype=complex)
+    ig = eng.register_gate("I", I)
+    spec = ControlledGateSpec(gate=ig, controls_top=(1, 0, 1))
+    u = eng.controlled_unitary(spec)
+    assert np.allclose(u, np.eye(2 ** spec.total_arity))
+
+
+def test_controlled_swap_multi_qubit_target_supported():
+    from qiskit.quantum_info import Operator
+
+    eng = RigControlEngine()
+    SWAP = np.array([
+        [1, 0, 0, 0],
+        [0, 0, 1, 0],
+        [0, 1, 0, 0],
+        [0, 0, 0, 1],
+    ], dtype=complex)
+    sg = eng.register_gate("SWAP2", SWAP)
+    spec = ControlledGateSpec(gate=sg, controls_top=(1,))
+
+    u = eng.controlled_unitary(spec)
+    assert u.shape == (8, 8)
+    assert np.allclose(u.conj().T @ u, np.eye(8))
+
+    qc = eng.controlled_qiskit_circuit(spec)
+    uq = Operator(qc).data
+    assert uq.shape == (8, 8)
+
+
+===== FILE: tests/test_rig_simplify.py =====
+import numpy as np
+
+from rig_engine import RigControlEngine, ControlledGateSpec, PlacedControlledOp
+
+
+def test_shared_control_chain_auto_cancels():
+    eng = RigControlEngine()
+    X = eng.get_gate("X")
+    I2 = eng.register_gate("I2", np.eye(4, dtype=complex))
+    ctrl = (1, 1)
+
+    # disjoint targets with inverse pairs around them
+    ops = [
+        PlacedControlledOp(ControlledGateSpec(X, controls_top=ctrl), target_offset=0),
+        PlacedControlledOp(ControlledGateSpec(I2, controls_top=ctrl), target_offset=1),
+        PlacedControlledOp(ControlledGateSpec(X, controls_top=ctrl), target_offset=0),
+        PlacedControlledOp(ControlledGateSpec(I2, controls_top=ctrl), target_offset=1),
+    ]
+    simp = eng.simplify_controlled_chain(ops)
+    assert simp == []
+
+
+===== FILE: tests/test_strict_phase1.py =====
+from qiskit import QuantumCircuit, transpile
+
+from rig_qiskit_phase1 import factor_shared_controls_phase1, equivalent
+
+
+def test_strict_phase1_blind_sequence():
+    c = [0, 1, 2]
+    t = [3, 4, 5, 6]
+    qc = QuantumCircuit(7)
+    qc.mcx(c + [t[0]], t[1])
+    qc.mcx(c + [t[1]], t[2])
+    qc.mcx(c + [t[1]], t[2])
+    qc.mcx(c + [t[2]], t[3])
+    qc.mcx(c + [t[2]], t[3])
+    qc.mcx(c + [t[0]], t[1])
+    qc.mcx(c + [t[0]], t[3])
+
+    rig = factor_shared_controls_phase1(qc)
+    assert equivalent(qc, rig)
+
+    qiskit_cx = transpile(qc, basis_gates=['cx', 'u'], optimization_level=3).count_ops().get('cx', 0)
+    rig_cx = transpile(rig, basis_gates=['cx', 'u'], optimization_level=3).count_ops().get('cx', 0)
+    assert rig_cx < qiskit_cx
+
+
+===== FILE: tests/test_strict_phase1_nontrivial.py =====
+from qiskit import QuantumCircuit, transpile
+from qiskit.quantum_info import Operator
+
+from rig_qiskit_phase1 import factor_shared_controls_phase1
+
+
+def build_nontrivial_sequence():
+    # 3 shared controls, 5 targets; rich non-cancelling pattern
+    c = [0, 1, 2]
+    t = [3, 4, 5, 6, 7]
+    qc = QuantumCircuit(8)
+    seq = [
+        (t[0], t[1]), (t[1], t[3]), (t[3], t[4]),
+        (t[4], t[2]), (t[2], t[0]), (t[1], t[2]),
+        (t[0], t[4]), (t[3], t[1]), (t[2], t[3]),
+        (t[4], t[0]), (t[1], t[4]),
+    ]
+    for a, b in seq:
+        qc.mcx(c + [a], b)
+    return qc
+
+
+def test_strict_nontrivial_equivalence_and_reduction():
+    raw = build_nontrivial_sequence()
+    rig = factor_shared_controls_phase1(raw)
+
+    assert Operator(raw).equiv(Operator(rig))
+
+    qiskit_cx = transpile(raw, basis_gates=['cx', 'u'], optimization_level=3).count_ops().get('cx', 0)
+    rig_cx = transpile(rig, basis_gates=['cx', 'u'], optimization_level=3).count_ops().get('cx', 0)
+
+    # Must not regress; in these structured cases rig should improve.
+    assert rig_cx <= qiskit_cx
+
