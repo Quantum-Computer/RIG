@@ -1,55 +1,6 @@
 ===== FILE: .gitkeep =====
 
 
-===== FILE: .pytest_cache/.gitignore =====
-# Created by pytest automatically.
-*
-
-
-===== FILE: .pytest_cache/CACHEDIR.TAG =====
-Signature: 8a477f597d28d172789f06886806bc55
-# This file is a cache directory tag created by pytest.
-# For information about cache directory tags, see:
-#	https://bford.info/cachedir/spec.html
-
-
-===== FILE: .pytest_cache/README.md =====
-# pytest cache directory #
-
-This directory contains data from the pytest's cache plugin,
-which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
-
-**Do not** commit this to version control.
-
-See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
-
-
-===== FILE: .pytest_cache/v/cache/lastfailed =====
-{}
-
-===== FILE: .pytest_cache/v/cache/nodeids =====
-[
-  "tests/test_rig_ast.py::test_complementarity_surrogate",
-  "tests/test_rig_ast.py::test_control_over_composition",
-  "tests/test_rig_ast.py::test_control_over_identity",
-  "tests/test_rig_ast.py::test_control_over_tensor_uneven_boxes",
-  "tests/test_rig_engine.py::test_controlled_identity_is_identity",
-  "tests/test_rig_engine.py::test_controlled_swap_multi_qubit_target_supported",
-  "tests/test_rig_engine.py::test_mixed_controls_x_engine_unitary",
-  "tests/test_rig_engine.py::test_positive_control_x_builds_qiskit_unitary",
-  "tests/test_rig_equations.py::test_a_composition",
-  "tests/test_rig_equations.py::test_b_identity",
-  "tests/test_rig_equations.py::test_c_strength",
-  "tests/test_rig_equations.py::test_d_color_change",
-  "tests/test_rig_equations.py::test_e_complementarity",
-  "tests/test_rig_equations.py::test_f_commutativity",
-  "tests/test_rig_equations.py::test_g_swap_axiom_checker",
-  "tests/test_rig_equations.py::test_h_swap_coherence_checker",
-  "tests/test_rig_simplify.py::test_shared_control_chain_auto_cancels",
-  "tests/test_strict_phase1.py::test_strict_phase1_blind_sequence",
-  "tests/test_strict_phase1_nontrivial.py::test_strict_nontrivial_equivalence_and_reduction"
-]
-
 ===== FILE: Goal.txt =====
 
 \title{
